@@ -3,9 +3,10 @@ import { envValidationSchema } from './env-validation';
 /**
  * Issue #46 — Verify that the Joi validation schema rejects missing required env vars.
  * Issue #255 — Verify that JWT_SECRET has minimum length 32 to prevent token forgery.
+ * Issue #923 — Verify that ORACLE_WEBHOOK_SECRET is required and has minimum length 16.
  */
 
-describe('Environment Variable Validation (#46, #255)', () => {
+describe('Environment Variable Validation (#46, #255, #923)', () => {
   const validEnv = {
     ADMIN_SECRET_KEY:
       'SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
@@ -127,5 +128,27 @@ describe('Environment Variable Validation (#46, #255)', () => {
     const { error } = envValidationSchema.validate(rest);
     expect(error).toBeDefined();
     expect(error!.message).toContain('IPFS_SECRET_KEY');
+  });
+
+  // ── #923: ORACLE_WEBHOOK_SECRET ─────────────────────────────────────────
+
+  it('fails when ORACLE_WEBHOOK_SECRET is missing', () => {
+    const { ORACLE_WEBHOOK_SECRET: _, ...rest } = validEnv;
+    const { error } = envValidationSchema.validate(rest);
+    expect(error).toBeDefined();
+    expect(error!.message).toContain('ORACLE_WEBHOOK_SECRET');
+  });
+
+  it('fails when ORACLE_WEBHOOK_SECRET is shorter than 16 characters', () => {
+    const invalidEnv = { ...validEnv, ORACLE_WEBHOOK_SECRET: 'tooshort' };
+    const { error } = envValidationSchema.validate(invalidEnv);
+    expect(error).toBeDefined();
+    expect(error!.message).toContain('ORACLE_WEBHOOK_SECRET');
+  });
+
+  it('passes when ORACLE_WEBHOOK_SECRET is exactly 16 characters', () => {
+    const env = { ...validEnv, ORACLE_WEBHOOK_SECRET: 'exactly16charss!' };
+    const { error } = envValidationSchema.validate(env);
+    expect(error).toBeUndefined();
   });
 });

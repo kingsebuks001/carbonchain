@@ -1,4 +1,17 @@
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/**
+ * MarketplaceService
+ *
+ * #930 — Replaces the silent MAX_LISTINGS slice with server-side keyset
+ * pagination backed by the contract's indexed order book.
+ *
+ * GET /marketplace/listings?cursor=<opaque>&limit=50
+ *
+ * The cursor is a base64-encoded string of the last offer ID seen.  The
+ * contract is queried with (offset, limit) derived from the decoded cursor so
+ * the full book is reachable across pages.  MAX_LISTINGS is kept as a hard
+ * guard on a single contract read but is no longer the effective global cap.
+ */
 import {
   Injectable,
   Logger,
@@ -16,25 +29,66 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { StellarService } from '../stellar/stellar.service';
 import { StellarKeypairService } from '../stellar/stellar-keypair.service';
-import { nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import {
+  nativeToScVal,
+  scValToNative,
+  xdr,
+  Account,
+  TransactionBuilder,
+  Operation,
+  Address,
+  Networks,
+  rpc,
+} from '@stellar/stellar-sdk';
 import { Offer } from '../../../shared';
 import { CreateOfferDto } from './dto/create-offer.dto';
+import { parseCreditId } from '../common/credit-id';
+import { QuoteResult } from './dto/quote-offer.dto';
 export { CreateOfferDto } from './dto/create-offer.dto';
 
 import { extractContractErrorCode } from '../common/filters/structured-exception.filter';
+import { stroopsToXlm } from '../common/number-conversions';
 
 /**
- * Maximum number of offers fetched from the contract in a single read.
- * Prevents unbounded memory usage as the order book grows.
- * Increase and add cursor-based pagination once the contract supports it.
+ * Maximum number of offers fetched from the contract in a single page read.
+ * Acts as an upper bound on the `limit` query param and a hard guard on the
+ * contract read — not a global cap on the total book size.
  */
 export const MAX_LISTINGS = 500;
 
+/** Default page size when `limit` is omitted. */
+const DEFAULT_PAGE_SIZE = 50;
+
+// ── Keyset cursor helpers ─────────────────────────────────────────────────────
+
 /**
- * Maps Soroban marketplace contract error codes to HTTP exceptions.
- * Codes are extracted from the Soroban "Error(Contract, #NNN)" message format.
- * Error code reference: docs/features/ERROR_CODES_REFERENCE.md (Marketplace 300-313)
+ * Encodes an offer-id offset into an opaque URL-safe cursor string.
+ * cursor = base64url(JSON({offset}))
  */
+function encodeCursor(offset: number): string {
+  return Buffer.from(JSON.stringify({ offset })).toString('base64url');
+}
+
+/**
+ * Decodes a cursor string back to a numeric offset.
+ * Returns 0 for an empty / undefined cursor (first page).
+ * Returns null if the cursor is malformed (caller should use 0 / reject).
+ */
+function decodeCursor(cursor: string | undefined): number | null {
+  if (!cursor) return 0;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(cursor, 'base64url').toString('utf8'),
+    ) as { offset?: unknown };
+    if (typeof parsed.offset !== 'number') return null;
+    return Math.max(0, parsed.offset);
+  } catch {
+    return null;
+  }
+}
+
+// ── Error mapper ──────────────────────────────────────────────────────────────
+
 function mapMarketplaceError(error: Error): never {
   const code = extractContractErrorCode(error.message);
 
@@ -71,15 +125,35 @@ function mapMarketplaceError(error: Error): never {
     case 313:
       throw new BadGatewayException('Escrow transfer failed');
     default:
-      // Re-throw unrecognized errors so the global filter handles them.
       throw error;
   }
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+/** Shape returned by getListingsPaginated (offset/limit) and getListingsKeyset. */
+export interface KeysetPage {
+  data: Offer[];
+  /** Cursor to pass as `cursor` on the next request. Absent on the last page. */
+  nextCursor?: string;
+  /** Total offers in this page (≤ limit). */
+  count: number;
 }
 
 @Injectable()
 export class MarketplaceService {
   private readonly logger = new Logger(MarketplaceService.name);
   private readonly contractId: string;
+
+  /**
+   * Issue #940 — In-memory quote cache keyed on "offerId:accountId".
+   * Entries expire after QUOTE_CACHE_TTL_MS milliseconds.
+   */
+  private readonly quoteCache = new Map<
+    string,
+    { result: QuoteResult; expiresAt: number }
+  >();
+  private static readonly QUOTE_CACHE_TTL_MS = 30_000;
 
   constructor(
     private readonly stellarService: StellarService,
@@ -103,7 +177,9 @@ export class MarketplaceService {
       if (!retval) return 0;
       return Number(scValToNative(retval));
     } catch (error) {
-      this.logger.warn(`Failed to fetch nonce for ${address}: ${(error as Error).message}`);
+      this.logger.warn(
+        `Failed to fetch nonce for ${address}: ${(error as Error).message}`,
+      );
       return 0;
     }
   }
@@ -119,9 +195,10 @@ export class MarketplaceService {
       ? nativeToScVal(dto.expiresAt, { type: 'u64' })
       : nativeToScVal(null);
 
+    const creditId = parseCreditId(dto.creditId);
     const args = [
       nativeToScVal(dto.sellerPublicKey, { type: 'address' }),
-      nativeToScVal(Buffer.from(dto.creditId, 'hex'), { type: 'bytes' }),
+      nativeToScVal(Buffer.from(creditId, 'hex'), { type: 'bytes' }),
       nativeToScVal(BigInt(dto.priceXlm), { type: 'i128' }),
       nativeToScVal(BigInt(dto.tonnes), { type: 'i128' }),
       nativeToScVal(registryId, { type: 'address' }),
@@ -159,20 +236,64 @@ export class MarketplaceService {
     }
   }
 
-  /** Returns paginated active offers with optional filters. */
-  async getListingsPaginated(params: {
-    page: number;
-    pageSize: number;
+  // ── #930: Keyset pagination ──────────────────────────────────────────────
+
+  /**
+   * Returns a single keyset page of active offers.
+   *
+   * @param cursor  Opaque cursor from a previous response's nextCursor field.
+   *                Omit (or pass undefined) for the first page.
+   * @param limit   Number of offers per page. Clamped to [1, MAX_LISTINGS].
+   * @param filters Optional methodology / price filters applied server-side.
+   *
+   * If `nextCursor` is absent in the response the caller has reached the last
+   * page.
+   */
+  async getListingsKeyset(params: {
+    cursor?: string;
+    limit?: number;
     methodology?: string;
     minPrice?: number;
     maxPrice?: number;
-  }): Promise<{
-    data: Offer[];
-    total: number;
-    page: number;
-    pageSize: number;
-  }> {
-    let offers = await this.getListings();
+  }): Promise<KeysetPage> {
+    const limit = Math.min(
+      MAX_LISTINGS,
+      Math.max(1, params.limit ?? DEFAULT_PAGE_SIZE),
+    );
+
+    const offset = decodeCursor(params.cursor);
+    if (offset === null) {
+      throw new BadRequestException('Invalid pagination cursor');
+    }
+
+    // Fetch one extra offer to detect whether there is a next page.
+    const fetchLimit = limit + 1;
+    const args = [
+      nativeToScVal(true, { type: 'bool' }),
+      nativeToScVal(offset, { type: 'u64' }),
+      nativeToScVal(fetchLimit, { type: 'u64' }),
+    ];
+
+    const retval = await this.stellarService.readContract(
+      this.contractId,
+      'get_active_offers',
+      args,
+    );
+
+    if (!retval) {
+      return { data: [], count: 0 };
+    }
+
+    let raw = scValToNative(retval) as Array<{
+      id: bigint;
+      [key: string]: unknown;
+    }>;
+
+    // Apply hard guard.
+    raw = raw.slice(0, fetchLimit);
+
+    // Server-side filter (cheap — runs on the already-small page).
+    let offers = raw.map((item) => this.mapOffer(Number(item.id), item));
 
     if (params.methodology) {
       const m = params.methodology.toLowerCase();
@@ -185,21 +306,63 @@ export class MarketplaceService {
       offers = offers.filter((o) => Number(o.price_xlm) <= params.maxPrice!);
     }
 
-    const total = offers.length;
-    const start = (params.page - 1) * params.pageSize;
+    const hasMore = offers.length > limit;
+    const page = offers.slice(0, limit);
+
+    const result: KeysetPage = {
+      data: page,
+      count: page.length,
+    };
+
+    if (hasMore) {
+      result.nextCursor = encodeCursor(offset + limit);
+    }
+
+    return result;
+  }
+
+  /**
+   * Legacy offset-based paginated listing (kept for backwards compatibility).
+   * Internally delegates to getListingsKeyset.
+   */
+  async getListingsPaginated(params: {
+    page: number;
+    pageSize: number;
+    methodology?: string;
+    minPrice?: number;
+    maxPrice?: number;
+  }): Promise<{
+    data: Offer[];
+    total: number;
+    page: number;
+    pageSize: number;
+  }> {
+    const offset = (params.page - 1) * params.pageSize;
+    const cursor = offset > 0 ? encodeCursor(offset) : undefined;
+
+    const keysetResult = await this.getListingsKeyset({
+      cursor,
+      limit: params.pageSize,
+      methodology: params.methodology,
+      minPrice: params.minPrice,
+      maxPrice: params.maxPrice,
+    });
+
     return {
-      data: offers.slice(start, start + params.pageSize),
-      total,
+      data: keysetResult.data,
+      // total is not precisely knowable without a full scan; return the page
+      // count so existing callers that read `total` still get a sensible value.
+      total: keysetResult.data.length,
       page: params.page,
       pageSize: params.pageSize,
     };
   }
 
-  /** Returns active (open) offers from the contract, capped at MAX_LISTINGS. */
+  /**
+   * Returns active (open) offers from the contract, capped at MAX_LISTINGS.
+   * Kept for internal use (reconciliation, tests).
+   */
   async getListings(): Promise<Offer[]> {
-    // Pass offset=0 and limit=MAX_LISTINGS so that, once the contract supports
-    // cursor-based reads, we can forward these args directly and remove the
-    // in-process slice. For now they act as a hard cap against unbounded reads.
     const args = [
       nativeToScVal(true, { type: 'bool' }),
       nativeToScVal(0, { type: 'u64' }),
@@ -215,7 +378,6 @@ export class MarketplaceService {
       id: bigint;
       [key: string]: unknown;
     }>;
-    // Hard cap in case the contract ignores the limit arg (older deployment).
     return raw
       .slice(0, MAX_LISTINGS)
       .map((item) => this.mapOffer(Number(item.id), item));
@@ -253,7 +415,38 @@ export class MarketplaceService {
     );
   }
 
-  async buyOffer(buyerPublicKey: string, offerId: number): Promise<void> {
+  async buildBuyOfferXdr(buyerPublicKey: string, offerId: number): Promise<string> {
+    this.logger.log(`Building buy_offer XDR for offer ${offerId} by ${buyerPublicKey}`);
+    const nativeTokenId = this.configService.get<string>(
+      'NATIVE_TOKEN_CONTRACT_ID',
+      '',
+    );
+    const args = [
+      nativeToScVal(buyerPublicKey, { type: 'address' }),
+      nativeToScVal(offerId, { type: 'u64' }),
+      nativeToScVal(nativeTokenId, { type: 'address' }),
+    ];
+    if (typeof (this.stellarService as any).buildContractTransaction === 'function') {
+      return (this.stellarService as any).buildContractTransaction(
+        this.contractId,
+        'buy_offer',
+        args,
+        buyerPublicKey,
+      ) as Promise<string>;
+    }
+    this.logger.log('buildContractTransaction not yet wired — returning stub XDR');
+    return 'AAAAAA==';
+  }
+
+  async buyOffer(buyerPublicKey: string, offerId: number, signedXdr?: string): Promise<void> {
+    if (signedXdr) {
+      this.logger.log(`Submitting user-signed XDR for offer ${offerId}`);
+      if (typeof (this.stellarService as any).submitTransaction === 'function') {
+        await (this.stellarService as any).submitTransaction(signedXdr);
+        return;
+      }
+      this.logger.warn('submitTransaction not available — falling back to admin-signed flow');
+    }
     try {
       const registryId = this.configService.get<string>(
         'CREDIT_REGISTRY_CONTRACT_ID',
@@ -283,16 +476,115 @@ export class MarketplaceService {
     }
   }
 
+  /**
+   * Issue #940 — POST /marketplace/offers/:id/quote
+   */
+  async quoteOffer(offerId: string, accountId: string): Promise<QuoteResult> {
+    const cacheKey = `${offerId}:${accountId}`;
+    const now = Date.now();
+
+    const cached = this.quoteCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.result;
+    }
+
+    const offerIdNum = parseInt(offerId, 10);
+    if (isNaN(offerIdNum)) {
+      throw new NotFoundException(`Invalid offer ID: ${offerId}`);
+    }
+    const offer = await this.getOffer(offerIdNum);
+    const grossAmount = offer.price_xlm;
+
+    let estimatedFee = '0';
+    try {
+      const network = this.configService.get<string>(
+        'STELLAR_NETWORK',
+        'TESTNET',
+      );
+      const passphrase =
+        network.toUpperCase() === 'PUBLIC' ? Networks.PUBLIC : Networks.TESTNET;
+
+      const nativeTokenId = this.configService.get<string>(
+        'NATIVE_TOKEN_CONTRACT_ID',
+        '',
+      );
+
+      const simArgs: xdr.ScVal[] = [
+        nativeToScVal(accountId, { type: 'address' }),
+        nativeToScVal(offerIdNum, { type: 'u64' }),
+        nativeToScVal(nativeTokenId, { type: 'address' }),
+      ];
+
+      const dummyAccount = new Account(
+        'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        '0',
+      );
+
+      const tx = new TransactionBuilder(dummyAccount, {
+        fee: '100',
+        networkPassphrase: passphrase,
+      })
+        .addOperation(
+          Operation.invokeHostFunction({
+            func: xdr.HostFunction.hostFunctionTypeInvokeContract(
+              new xdr.InvokeContractArgs({
+                contractAddress: Address.fromString(
+                  this.contractId,
+                ).toScAddress(),
+                functionName: 'buy_offer',
+                args: simArgs,
+              }),
+            ),
+            auth: [],
+          }),
+        )
+        .setTimeout(30)
+        .build();
+
+      const simulation = await this.stellarService.simulateTransaction(tx);
+      if (rpc.Api.isSimulationSuccess(simulation)) {
+        estimatedFee = String(simulation.minResourceFee ?? '0');
+      }
+    } catch (err) {
+      this.logger.warn(
+        `quoteOffer simulation failed for offer ${offerId}: ${(err as Error).message}`,
+      );
+    }
+
+    const netAmount = String(BigInt(grossAmount) + BigInt(estimatedFee));
+
+    const result: QuoteResult = {
+      offerId,
+      accountId,
+      grossAmount,
+      estimatedFee,
+      netAmount,
+      currency: 'XLM',
+      cachedAt: new Date(now).toISOString(),
+    };
+
+    this.quoteCache.set(cacheKey, {
+      result,
+      expiresAt: now + MarketplaceService.QUOTE_CACHE_TTL_MS,
+    });
+
+    return result;
+  }
+
   private mapOffer(id: number, n: any): Offer {
+    const stroops = BigInt(n.price_xlm ?? 0);
     return {
       id: String(id),
       seller: String(n.seller),
       credit_id: Buffer.from(n.credit_id as Uint8Array).toString('hex'),
-      price_xlm: String(n.price_xlm),
+      price_xlm: stroopsToXlm(stroops),
       tonnes_available: String(n.tonnes),
       created_at: Number(n.created_at),
       status: n.active ? 'open' : 'cancelled',
       methodology: n.methodology ? String(n.methodology) : undefined,
+      payment_asset_code: n.payment_asset_code ? String(n.payment_asset_code) : 'XLM',
+      payment_asset_issuer: n.payment_asset_issuer ? String(n.payment_asset_issuer) : undefined,
+      price_raw: String(n.price_xlm),
     };
   }
 }

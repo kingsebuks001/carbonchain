@@ -22,6 +22,9 @@ import { CacheService } from '../common/cache.service';
 import { VerifierEntity } from './verifier.entity';
 import type { IVerifierRepository } from './verifier.repository';
 import { VERIFIER_REPOSITORY } from './verifier.repository';
+import { VerifierApplicationEntity, VerifierApplicationStatus } from './verifier-application.entity';
+import type { IVerifierApplicationRepository } from './verifier-application.repository';
+import { VERIFIER_APPLICATION_REPOSITORY } from './verifier-application.repository';
 
 export interface VerifierInfo {
   address: string;
@@ -32,6 +35,16 @@ export interface VerifierInfo {
     disputeCount: number;
   };
   registeredAt?: Date;
+  /**
+   * Issue #946 — ISO-8601 timestamp of the last successful on-chain
+   * reconcile. Null for records that pre-date the sync feature.
+   */
+  syncedAt?: Date | null;
+  /**
+   * Issue #946 — True when this record is present in the DB but missing
+   * from the live on-chain verifier list (possible out-of-band removal).
+   */
+  unstable?: boolean;
 }
 
 const REPUTATION_KEY = (address: string) => `verifiers:reputation:${address}`;
@@ -61,6 +74,8 @@ export class VerifiersService implements OnApplicationBootstrap {
     private readonly cache: CacheService,
     @Inject(VERIFIER_REPOSITORY)
     private readonly verifierRepo: IVerifierRepository,
+    @Inject(VERIFIER_APPLICATION_REPOSITORY)
+    private readonly verifierAppRepo: IVerifierApplicationRepository,
   ) {
     this.contractId = this.configService.get<string>(
       'CREDIT_REGISTRY_CONTRACT_ID',
@@ -91,41 +106,86 @@ export class VerifiersService implements OnApplicationBootstrap {
    * Reconcile the off-chain DB with the current on-chain verifier list.
    *
    * For each on-chain address:
-   *  - If it already exists in the DB → skip (preserve existing metadata).
-   *  - If it is new → insert with empty name/capabilities.
+   *  - If it already exists in the DB → upsert (update syncedAt, clear unstable).
+   *  - If it is new → insert with empty name/capabilities and syncedAt = now.
+   *
+   * For each DB address NOT found on-chain:
+   *  - Mark as `unstable = true` and log an audit warning. The record is
+   *    preserved (never deleted) so off-chain metadata is not lost.
+   *
+   * Issue #946: Any change (new verifier or unstable flip) is logged as an
+   * audit entry so operators have an immutable record of drift events.
    */
   async syncOnChainVerifiers(): Promise<void> {
     this.logger.log('Syncing on-chain verifiers with local database…');
 
     const onChainVerifiers = await this.fetchOnChainVerifiers();
-    if (onChainVerifiers.length === 0) {
-      this.logger.log('No on-chain verifiers found — skipping sync.');
-      return;
-    }
+    const onChainSet = new Set(onChainVerifiers);
 
     const existing = await this.verifierRepo.findAll();
-    const existingAddresses = new Set(existing.map((v) => v.address));
+    const existingByAddress = new Map(existing.map((v) => [v.address, v]));
+    const now = new Date();
 
-    const toInsert: VerifierEntity[] = [];
+    // ── Step 1: Upsert all on-chain verifiers ────────────────────────────────
+    const toUpsert: VerifierEntity[] = [];
+
     for (const address of onChainVerifiers) {
-      if (!existingAddresses.has(address)) {
+      const existing = existingByAddress.get(address);
+      if (existing) {
+        // Already in DB — refresh syncedAt and clear any previous unstable flag.
+        const wasUnstable = existing.unstable;
+        existing.syncedAt = now;
+        existing.unstable = false;
+        toUpsert.push(existing);
+        if (wasUnstable) {
+          // Audit: verifier was previously flagged unstable but is now back on-chain.
+          this.logger.log(
+            `[audit:verifier-sync] address=${address} event=restored_to_chain syncedAt=${now.toISOString()}`,
+          );
+        }
+      } else {
+        // New on-chain verifier not yet in the DB — insert it.
         const entity = new VerifierEntity();
         entity.address = address;
         entity.name = null;
         entity.capabilities = [];
         entity.reputation = { approvalCount: 0, disputeCount: 0 };
-        toInsert.push(entity);
+        entity.unstable = false;
+        entity.syncedAt = now;
+        toUpsert.push(entity);
+        // Audit: new verifier discovered on-chain.
+        this.logger.log(
+          `[audit:verifier-sync] address=${address} event=discovered_on_chain syncedAt=${now.toISOString()}`,
+        );
       }
     }
 
-    if (toInsert.length > 0) {
-      await this.verifierRepo.saveAll(toInsert);
-      this.logger.log(
-        `Sync complete: inserted ${toInsert.length} new verifier(s).`,
-      );
-    } else {
-      this.logger.log('Sync complete: no new verifiers to insert.');
+    if (toUpsert.length > 0) {
+      await this.verifierRepo.saveAll(toUpsert);
     }
+
+    // ── Step 2: Mark DB-only verifiers as unstable ───────────────────────────
+    const toMarkUnstable: VerifierEntity[] = [];
+
+    for (const entity of existing) {
+      if (!onChainSet.has(entity.address) && !entity.unstable) {
+        entity.unstable = true;
+        entity.syncedAt = now;
+        toMarkUnstable.push(entity);
+        // Audit: verifier present in DB but absent from chain (possible removal).
+        this.logger.warn(
+          `[audit:verifier-sync] address=${entity.address} event=missing_from_chain unstable=true syncedAt=${now.toISOString()}`,
+        );
+      }
+    }
+
+    if (toMarkUnstable.length > 0) {
+      await this.verifierRepo.saveAll(toMarkUnstable);
+    }
+
+    this.logger.log(
+      `Sync complete: upserted=${toUpsert.length} markedUnstable=${toMarkUnstable.length}`,
+    );
   }
 
   // ── Queries ───────────────────────────────────────────────────────────────
@@ -638,6 +698,59 @@ export class VerifiersService implements OnApplicationBootstrap {
       capabilities: entity.capabilities,
       reputation: entity.reputation,
       registeredAt: entity.registeredAt,
+      // Issue #946 — expose the on-chain reconcile timestamp and stability flag.
+      syncedAt: entity.syncedAt ?? null,
+      unstable: entity.unstable ?? false,
     };
+  }
+
+  // ── Applications (Issue #967) ───────────────────────────────────────────────
+
+  async submitApplication(data: {
+    address: string;
+    name: string;
+    capabilities: string[];
+    documentsCid: string;
+    stakeToken: string;
+    stakeAmount: string;
+  }): Promise<VerifierApplicationEntity> {
+    const repo = this.verifierAppRepo;
+    const existing = await repo.findByAddress(data.address);
+    if (existing && existing.status === VerifierApplicationStatus.Pending) {
+      throw new ConflictException('Application already pending for this address');
+    }
+    const entity = repo.create({
+      address: data.address,
+      name: data.name,
+      capabilities: data.capabilities,
+      documentsCid: data.documentsCid,
+      stakeToken: data.stakeToken,
+      stakeAmount: data.stakeAmount,
+      status: VerifierApplicationStatus.Pending,
+    });
+    return repo.save(entity);
+  }
+
+  async getApplication(address: string): Promise<VerifierApplicationEntity | null> {
+    return this.verifierAppRepo.findByAddress(address);
+  }
+
+  async listApplications(status?: VerifierApplicationStatus): Promise<VerifierApplicationEntity[]> {
+    const all = await this.verifierAppRepo.findAll();
+    if (!status) return all;
+    return all.filter((a) => a.status === status);
+  }
+
+  async reviewApplication(
+    address: string,
+    status: VerifierApplicationStatus,
+    reviewedBy: string,
+  ): Promise<VerifierApplicationEntity | null> {
+    if (status !== VerifierApplicationStatus.Approved && status !== VerifierApplicationStatus.Rejected) {
+      throw new BadRequestException('Invalid review status');
+    }
+    const updated = await this.verifierAppRepo.updateStatus(address, status, reviewedBy);
+    if (!updated) return null;
+    return updated;
   }
 }
