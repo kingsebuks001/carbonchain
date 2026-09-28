@@ -117,15 +117,25 @@ export class StellarService implements OnModuleInit {
 
     switch (network.toUpperCase()) {
       case 'PUBLIC':
+      // Bug fix: 'mainnet' (and 'MAINNET') must map to Networks.PUBLIC, not
+      // fall through to TESTNET.  The canonical Stellar name for mainnet is
+      // 'PUBLIC', but operators commonly write 'mainnet' in their .env files.
+      case 'MAINNET':
         this.networkPassphrase = Networks.PUBLIC;
         break;
       case 'FUTURENET':
         this.networkPassphrase = Networks.FUTURENET;
         break;
       case 'TESTNET':
-      default:
         this.networkPassphrase = Networks.TESTNET;
         break;
+      default:
+        // Bug fix: unknown network values must cause a hard startup failure
+        // rather than silently falling through to TESTNET.
+        throw new Error(
+          `Unknown STELLAR_NETWORK value: "${network}". ` +
+            `Accepted values: testnet, mainnet, public, futurenet.`,
+        );
     }
 
     this.logger.log(`StellarService initialized for ${network} network`);
@@ -324,6 +334,18 @@ export class StellarService implements OnModuleInit {
           if ((response.status as string) === 'PENDING') {
             const result = await this.pollTransactionStatus(response.hash);
             this.invalidateAccountInfoCache(pk);
+
+            // Bug fix: FAILED transactions must not be reported as successful.
+            // Throw here so the catch block in invokeContract emits the failure
+            // event and the caller receives an error rather than a FAILED result.
+            if (
+              (result.status as string) ===
+              rpc.Api.GetTransactionStatus.FAILED
+            ) {
+              throw new Error(
+                `Transaction failed on-chain: ${result.status} (hash: ${response.hash})`,
+              );
+            }
 
             // Issue #495 — emit success event (replaces direct MetricsService call).
             this.metricsEmitter?.emit(CONTRACT_INVOCATION_COMPLETED, {

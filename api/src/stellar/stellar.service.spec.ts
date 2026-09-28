@@ -311,6 +311,199 @@ describe('StellarService - sequence number integration', () => {
     });
   });
 
+  // ── Bug fix: FAILED transaction status throws error ────────────────────────
+
+  describe('FAILED transaction status handling (bug fix)', () => {
+    it('throws when pollTransactionStatus returns FAILED status', async () => {
+      seqNoManager.cacheSequenceNumber(signerKeypair.publicKey(), 10);
+
+      mockSimulateTransaction.mockResolvedValue({
+        transactionData: 'AAAAAA==',
+        minResourceFee: '500',
+        result: { retval: 'test' },
+      });
+      mockSendTransaction.mockResolvedValue({
+        status: 'PENDING',
+        hash: 'failed-hash',
+      });
+      // pollTransactionStatus returns a FAILED result
+      mockGetTransaction.mockResolvedValue({
+        status: 'FAILED',
+        hash: 'failed-hash',
+      });
+
+      await expect(
+        service.invokeContract(CONTRACT_ID, 'test_method', [], signerKeypair),
+      ).rejects.toThrow('Transaction failed on-chain');
+    });
+
+    it('does not emit CONTRACT_INVOCATION_COMPLETED success event when transaction is FAILED', async () => {
+      const { EventEmitter } = jest.requireActual<typeof import('events')>('events');
+      const emitter = new EventEmitter();
+      const emitSpy = jest.spyOn(emitter, 'emit');
+
+      // Build a module that injects the metrics emitter
+      const moduleWithEmitter = await Test.createTestingModule({
+        providers: [
+          StellarService,
+          SequenceNumberManager,
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn((key: string, def?: unknown) => {
+                if (key === 'HORIZON_URL')
+                  return 'https://horizon-testnet.stellar.org';
+                if (key === 'SOROBAN_RPC_URL')
+                  return 'https://soroban-testnet.stellar.org';
+                if (key === 'STELLAR_NETWORK') return 'TESTNET';
+                return def;
+              }),
+            },
+          },
+          { provide: 'METRICS_EVENT_EMITTER', useValue: emitter },
+        ],
+      }).compile();
+
+      const svcWithEmitter =
+        moduleWithEmitter.get<StellarService>(StellarService);
+      const seqMgrWithEmitter =
+        moduleWithEmitter.get<SequenceNumberManager>(SequenceNumberManager);
+      svcWithEmitter.onModuleInit();
+      seqMgrWithEmitter.cacheSequenceNumber(signerKeypair.publicKey(), 20);
+
+      mockSimulateTransaction.mockResolvedValue({
+        transactionData: 'AAAAAA==',
+        minResourceFee: '500',
+        result: { retval: 'test' },
+      });
+      mockSendTransaction.mockResolvedValue({
+        status: 'PENDING',
+        hash: 'failed-emit-hash',
+      });
+      mockGetTransaction.mockResolvedValue({
+        status: 'FAILED',
+        hash: 'failed-emit-hash',
+      });
+
+      await expect(
+        svcWithEmitter.invokeContract(
+          CONTRACT_ID,
+          'test_method',
+          [],
+          signerKeypair,
+        ),
+      ).rejects.toThrow();
+
+      // success event must NOT have been emitted
+      const successCalls = emitSpy.mock.calls.filter(
+        ([event, payload]) =>
+          event === 'contract.invocation.completed' &&
+          (payload as { status?: string }).status === 'success',
+      );
+      expect(successCalls).toHaveLength(0);
+
+      // failure event MUST have been emitted (via the catch block)
+      const failureCalls = emitSpy.mock.calls.filter(
+        ([event, payload]) =>
+          event === 'contract.invocation.completed' &&
+          (payload as { status?: string }).status === 'failure',
+      );
+      expect(failureCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('does NOT throw when pollTransactionStatus returns SUCCESS', async () => {
+      seqNoManager.cacheSequenceNumber(signerKeypair.publicKey(), 30);
+
+      mockSimulateTransaction.mockResolvedValue({
+        transactionData: 'AAAAAA==',
+        minResourceFee: '500',
+        result: { retval: 'test' },
+      });
+      mockSendTransaction.mockResolvedValue({
+        status: 'PENDING',
+        hash: 'success-hash',
+      });
+      mockGetTransaction.mockResolvedValue({
+        status: 'SUCCESS',
+        hash: 'success-hash',
+      });
+
+      const result = await service.invokeContract(
+        CONTRACT_ID,
+        'test_method',
+        [],
+        signerKeypair,
+      );
+      expect(result.status).toBe('SUCCESS');
+    });
+  });
+
+  // ── Bug fix: mainnet/MAINNET network misconfiguration ──────────────────────
+
+  describe('onModuleInit network configuration (bug fix)', () => {
+    it('resolves Networks.PUBLIC when STELLAR_NETWORK is "mainnet"', async () => {
+      const { Networks } = jest.requireActual<
+        typeof import('@stellar/stellar-sdk')
+      >('@stellar/stellar-sdk');
+
+      const mainnetModule = await buildModule({ STELLAR_NETWORK: 'mainnet' });
+      const mainnetService =
+        mainnetModule.get<StellarService>(StellarService);
+      mainnetService.onModuleInit();
+
+      expect(mainnetService.getNetworkPassphrase()).toBe(Networks.PUBLIC);
+    });
+
+    it('resolves Networks.PUBLIC when STELLAR_NETWORK is "PUBLIC"', async () => {
+      const { Networks } = jest.requireActual<
+        typeof import('@stellar/stellar-sdk')
+      >('@stellar/stellar-sdk');
+
+      const publicModule = await buildModule({ STELLAR_NETWORK: 'PUBLIC' });
+      const publicService = publicModule.get<StellarService>(StellarService);
+      publicService.onModuleInit();
+
+      expect(publicService.getNetworkPassphrase()).toBe(Networks.PUBLIC);
+    });
+
+    it('resolves Networks.TESTNET when STELLAR_NETWORK is "testnet"', async () => {
+      const { Networks } = jest.requireActual<
+        typeof import('@stellar/stellar-sdk')
+      >('@stellar/stellar-sdk');
+
+      const testnetModule = await buildModule({ STELLAR_NETWORK: 'testnet' });
+      const testnetService =
+        testnetModule.get<StellarService>(StellarService);
+      testnetService.onModuleInit();
+
+      expect(testnetService.getNetworkPassphrase()).toBe(Networks.TESTNET);
+    });
+
+    it('resolves Networks.FUTURENET when STELLAR_NETWORK is "futurenet"', async () => {
+      const { Networks } = jest.requireActual<
+        typeof import('@stellar/stellar-sdk')
+      >('@stellar/stellar-sdk');
+
+      const futureModule = await buildModule({ STELLAR_NETWORK: 'futurenet' });
+      const futureService = futureModule.get<StellarService>(StellarService);
+      futureService.onModuleInit();
+
+      expect(futureService.getNetworkPassphrase()).toBe(Networks.FUTURENET);
+    });
+
+    it('throws a startup error for an unrecognised STELLAR_NETWORK value', async () => {
+      const unknownModule = await buildModule({
+        STELLAR_NETWORK: 'staging-private',
+      });
+      const unknownService =
+        unknownModule.get<StellarService>(StellarService);
+
+      expect(() => unknownService.onModuleInit()).toThrow(
+        'Unknown STELLAR_NETWORK value',
+      );
+    });
+  });
+
   // ── Dynamic fee estimation (#472) ──────────────────────────────────────────
 
   describe('dynamic fee estimation (#472)', () => {

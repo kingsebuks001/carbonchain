@@ -7,7 +7,9 @@ export const envValidationSchema = Joi.object({
   DATABASE_REPLICA_URLS: Joi.string().optional().allow(''),
   JWT_SECRET: Joi.string().required().min(32),
   ORACLE_WEBHOOK_SECRET: Joi.string().required().min(16),
-  STELLAR_NETWORK: Joi.string().valid('testnet', 'mainnet').default('testnet'),
+  STELLAR_NETWORK: Joi.string()
+    .valid('testnet', 'mainnet', 'public', 'futurenet')
+    .default('testnet'),
   STELLAR_HORIZON_URL: Joi.string().uri().required(),
   STELLAR_SOROBAN_RPC: Joi.string().uri().required(),
   IPFS_API_KEY: Joi.string().required(),

@@ -70,6 +70,39 @@ describe('Environment Variable Validation (#46, #255)', () => {
     expect(value.STELLAR_NETWORK).toBe('testnet');
   });
 
+  it('accepts STELLAR_NETWORK of "mainnet"', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      STELLAR_NETWORK: 'mainnet',
+    });
+    expect(error).toBeUndefined();
+  });
+
+  it('accepts STELLAR_NETWORK of "public"', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      STELLAR_NETWORK: 'public',
+    });
+    expect(error).toBeUndefined();
+  });
+
+  it('accepts STELLAR_NETWORK of "futurenet"', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      STELLAR_NETWORK: 'futurenet',
+    });
+    expect(error).toBeUndefined();
+  });
+
+  it('rejects an unrecognised STELLAR_NETWORK value', () => {
+    const { error } = envValidationSchema.validate({
+      ...validEnv,
+      STELLAR_NETWORK: 'staging-private',
+    });
+    expect(error).toBeDefined();
+    expect(error!.message).toContain('STELLAR_NETWORK');
+  });
+
   it('applies default LOG_LEVEL of info when not set', () => {
     const { value } = envValidationSchema.validate(validEnv);
     expect(value.LOG_LEVEL).toBe('info');
