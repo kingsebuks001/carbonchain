@@ -24,6 +24,7 @@ import { WebhooksModule } from './webhooks/webhooks.module';
 import { OracleModule } from './oracle/oracle.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { RequestMetricsMiddleware } from './metrics/request-metrics.middleware';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 
 @Module({
   imports: [
@@ -72,6 +73,7 @@ import { RequestMetricsMiddleware } from './metrics/request-metrics.middleware';
     WebhooksModule,
     OracleModule,
     MetricsModule,
+    ReconciliationModule,
   ],
   controllers: [AppController],
   providers: [
@@ -84,6 +86,9 @@ import { RequestMetricsMiddleware } from './metrics/request-metrics.middleware';
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
+    // RequestIdMiddleware must run first so that LoggingMiddleware,
+    // RequestMetricsMiddleware and downstream service calls can read the
+    // request id from RequestContextStore.
     consumer
       .apply(RequestIdMiddleware, LoggingMiddleware, RequestMetricsMiddleware)
       .forRoutes('*');

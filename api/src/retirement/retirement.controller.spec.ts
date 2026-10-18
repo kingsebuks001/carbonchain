@@ -7,6 +7,7 @@ import {
 import { RetirementController } from './retirement.controller';
 import { RetirementService } from './retirement.service';
 import { CertificateService } from './certificate.service';
+import { CertHashReconciler } from './cert-hash-reconciler.service';
 import { RetirementRecord } from '../../../shared';
 import { StellarAddressPipe } from '../common/pipes/stellar-address.pipe';
 
@@ -23,6 +24,10 @@ const mockCertificateService = {
   generatePdf: jest.fn(),
 };
 
+const mockCertHashReconciler = {
+  reconcile: jest.fn(),
+};
+
 // A valid Stellar ed25519 public key (G + 55 base32 chars, 56 total).
 const VALID_STELLAR_ADDRESS =
   'GBSOK5REZRYMHX5ZJNDZUPUKLDVSAXTJ6D5OKXWOEENUTLZHOP2TWZDY';
@@ -36,6 +41,7 @@ describe('RetirementController', () => {
       providers: [
         { provide: RetirementService, useValue: mockRetirementService },
         { provide: CertificateService, useValue: mockCertificateService },
+        { provide: CertHashReconciler, useValue: mockCertHashReconciler },
         StellarAddressPipe,
       ],
     }).compile();
@@ -100,6 +106,36 @@ describe('RetirementController', () => {
         tonnes: mockRetirement.tonnes_retired,
         reason: mockRetirement.reason,
         timestamp: mockRetirement.retired_at,
+      });
+    });
+
+    it('should include vintageYear in CertificateData when present on record', async () => {
+      const retirementId = 'abc-vintage';
+      const mockRetirement: RetirementRecord = {
+        id: retirementId,
+        credit_id: 'credit-vintage',
+        buyer: 'GBUYER',
+        tonnes_retired: '500000',
+        reason: 'Scope 1',
+        retired_at: 1700000000,
+        tx_hash: 'txhash-vintage',
+        vintage_year: 2025,
+      };
+      const mockPdfBuffer = Buffer.from('%PDF-1.4');
+
+      mockRetirementService.getRetirement.mockResolvedValueOnce(mockRetirement);
+      mockCertificateService.generatePdf.mockResolvedValueOnce(mockPdfBuffer);
+
+      await controller.downloadCertificate(retirementId);
+
+      expect(mockCertificateService.generatePdf).toHaveBeenCalledWith({
+        retirementId,
+        creditId: mockRetirement.credit_id,
+        buyer: mockRetirement.buyer,
+        tonnes: mockRetirement.tonnes_retired,
+        reason: mockRetirement.reason,
+        timestamp: mockRetirement.retired_at,
+        vintageYear: 2025,
       });
     });
 

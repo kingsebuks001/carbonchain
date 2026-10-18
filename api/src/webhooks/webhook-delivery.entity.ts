@@ -1,5 +1,6 @@
 import {
   Column,
+  CreateDateColumn,
   Entity,
   Index,
   ManyToOne,
@@ -13,6 +14,7 @@ import { WebhookEntity } from './webhook.entity';
  * consistent across pods.
  */
 @Entity('webhook_deliveries')
+@Index(['webhookId', 'createdAt'])
 export class WebhookDeliveryEntity {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -28,11 +30,29 @@ export class WebhookDeliveryEntity {
   @Column()
   eventId: string;
 
+  /**
+   * #1182 — event type used by the delivery history filters.  Indexed so
+   * filtered queries can do an index scan instead of a sequential scan.
+   */
+  @Index()
+  @Column({ type: 'varchar', nullable: true })
+  eventType?: string;
+
+  @Index()
   @Column({ default: 'pending' })
   status: 'pending' | 'success' | 'failed';
 
   @Column({ default: 0 })
   attempts: number;
+
+  /**
+   * #935 — creation timestamp used by the GC janitor to enforce the
+   * retention window.  Indexed so the purge query can do a range scan
+   * without a sequential table scan.
+   */
+  @Index()
+  @CreateDateColumn({ type: 'timestamptz' })
+  createdAt: Date;
 
   @Column({ type: 'timestamptz', nullable: true })
   lastAttemptAt?: Date;

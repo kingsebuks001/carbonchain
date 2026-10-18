@@ -84,6 +84,20 @@ pub struct Offer {
     pub expires_at: Option<u64>,
 }
 
+/// Aggregate marketplace statistics returned by `get_marketplace_stats`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MarketplaceStats {
+    /// Total number of offers ever created (including closed/cancelled).
+    pub total_offers: u64,
+    /// Number of currently active (open, non-expired) offers.
+    pub active_offers: u64,
+    /// Cumulative XLM volume (in stroops) across all completed buy_offer calls.
+    pub total_volume_xlm: i128,
+    /// Cumulative token volume per token address for SAC-token-based offers.
+    pub total_volume_tokens: Map<Address, i128>,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -210,6 +224,13 @@ fn get_nonce(env: &Env, addr: &Address) -> u64 {
         .unwrap_or(0u64)
 }
 
+/// #1095 — no-op migration stub. Called by `upgrade` before swapping WASM.
+/// Future schema migrations go here as the contract evolves.
+fn run_migrations(_env: &Env) {
+    // No-op for v1 → v2 transition.
+    // Add field back-fills or index rebuilds here in future versions.
+}
+
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Marketplace {
@@ -280,6 +301,83 @@ impl Marketplace {
             .unwrap_or(false)
     }
 
+    // ── #1095 — Version / Migration ─────────────────────────────────────────
+
+    /// Returns the current schema version of the contract.
+    pub fn get_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32)
+    }
+
+    // ── #1096 — Allowed token management ────────────────────────────────────
+
+    /// Returns the list of admin-approved SAC token addresses.
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Add a token address to the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn add_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Only add if not already present
+        if !tokens.iter().any(|t| t == token) {
+            tokens.push_back(token);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
+    }
+
+    /// Remove a token address from the admin-approved allowed list.
+    ///
+    /// # Errors
+    /// - [`MarketplaceError::NotInitialized`] / [`MarketplaceError::Unauthorized`]
+    pub fn remove_allowed_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+        nonce: u64,
+    ) -> Result<(), MarketplaceError> {
+        Self::require_admin(&env, &admin)?;
+        if !Self::consume_nonce(&env, &admin, nonce) {
+            return Err(MarketplaceError::InvalidNonce);
+        }
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = tokens.iter().position(|t| t == token) {
+            tokens.remove(pos as u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::AllowedTokens, &tokens);
+        }
+        Ok(())
+    }
+
     // ── Offers ───────────────────────────────────────────────────────────────
 
     /// List a credit for sale with XLM pricing. Returns the new offer ID.
@@ -331,7 +429,8 @@ impl Marketplace {
     /// The buyer must hold enough of the specified asset before calling [`buy_offer`].
     ///
     /// # Errors
-    /// Same as [`create_offer`].
+    /// Same as [`create_offer`], plus:
+    /// - [`MarketplaceError::InvalidToken`] — `price_asset` is not in the allowed list.
     pub fn create_offer_with_asset(
         env: Env,
         seller: Address,
@@ -343,6 +442,12 @@ impl Marketplace {
         expires_at: Option<u64>,
         nonce: u64,
     ) -> Result<u64, MarketplaceError> {
+        // #1096 — validate SAC token is in allowed list
+        if let AssetType::Asset(ref sac) = price_asset {
+            if !Self::is_token_allowed(&env, sac) {
+                return Err(MarketplaceError::InvalidToken);
+            }
+        }
         Self::create_offer_internal(
             env,
             seller,
@@ -412,6 +517,13 @@ impl Marketplace {
         }
         if tonnes > credit.tonnes {
             return Err(MarketplaceError::InvalidTonnes);
+        }
+
+        // #1092: validate expires_at is strictly in the future
+        if let Some(exp) = expires_at {
+            if exp <= env.ledger().timestamp() {
+                return Err(MarketplaceError::InvalidExpiry);
+            }
         }
 
         let registry_nonce: u64 = env.invoke_contract(
@@ -488,7 +600,11 @@ impl Marketplace {
         if ids.len() >= 50 {
             let mut pruned = Vec::new(&env);
             for id in ids.iter() {
-                if let Some(o) = env.storage().persistent().get::<_, Offer>(&DataKey::Offer(id)) {
+                if let Some(o) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Offer>(&DataKey::Offer(id))
+                {
                     if o.active {
                         pruned.push_back(id);
                     }
@@ -656,6 +772,9 @@ impl Marketplace {
                 .persistent()
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
+
+        // #1091: decrement active offers counter
+        Self::decrement_active_count(&env);
 
         OfferCxl {
             seller: seller.clone(),
@@ -830,9 +949,11 @@ impl Marketplace {
                                 env.storage().persistent().remove(&seller_key);
                             } else {
                                 env.storage().persistent().set(&seller_key, &seller_ids);
-                                env.storage()
-                                    .persistent()
-                                    .extend_ttl(&seller_key, TTL_THRESHOLD, MIN_TTL);
+                                env.storage().persistent().extend_ttl(
+                                    &seller_key,
+                                    TTL_THRESHOLD,
+                                    MIN_TTL,
+                                );
                             }
                         }
                     }
@@ -972,6 +1093,7 @@ impl Marketplace {
     /// - [`MarketplaceError::AlreadyClosed`] — offer has already been cancelled/filled.
     /// - [`MarketplaceError::OfferExpired`] — offer has expired.
     /// - [`MarketplaceError::InsufficientFunds`] — buyer balance is less than `price_amount`.
+    /// - [`MarketplaceError::InvalidToken`] — SAC token is not in the allowed list.
     /// - [`MarketplaceError::Overflow`] — price is zero or negative (corrupt state).
     pub fn buy_offer(
         env: Env,
@@ -1102,6 +1224,38 @@ impl Marketplace {
                 .extend_ttl(&DataKey::ActiveOffers, TTL_THRESHOLD, MIN_TTL);
         }
 
+        // #1091: decrement active offers counter and accumulate volume
+        Self::decrement_active_count(&env);
+        // All marketplace offers are priced in native XLM (price_xlm in stroops).
+        // Accumulate into TotalVolumeXLM; TotalVolumeTokens tracks SAC-token-based
+        // volume if token_id differs from the native XLM contract in future extensions.
+        let prev_xlm_vol: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeXLM)
+            .unwrap_or(0i128);
+        let new_xlm_vol = prev_xlm_vol.saturating_add(price);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeXLM, &new_xlm_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeXLM, TTL_THRESHOLD, MIN_TTL);
+        // Also record per-token volume so callers can distinguish native XLM vs SAC tokens.
+        let mut token_vol: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalVolumeTokens)
+            .unwrap_or_else(|| Map::new(&env));
+        let prev_tok_vol: i128 = token_vol.get(token_id.clone()).unwrap_or(0i128);
+        token_vol.set(token_id, prev_tok_vol.saturating_add(price));
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalVolumeTokens, &token_vol);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TotalVolumeTokens, TTL_THRESHOLD, MIN_TTL);
+
         Ok(())
     }
 
@@ -1230,6 +1384,38 @@ impl Marketplace {
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
+    /// Increment `ActiveOffersCount` by one. Called when a new active offer is created.
+    fn increment_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
+
+    /// Decrement `ActiveOffersCount` by one (saturating at zero). Called on cancel or buy.
+    fn decrement_active_count(env: &Env) {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveOffersCount)
+            .unwrap_or(0u64);
+        let new_count = count.saturating_sub(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveOffersCount, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::ActiveOffersCount, TTL_THRESHOLD, MIN_TTL);
+    }
+
     fn next_id(env: &Env) -> Result<u64, MarketplaceError> {
         let id: u64 = env
             .storage()
@@ -1329,6 +1515,16 @@ impl Marketplace {
         true
     }
 
+    /// #1096 — returns true if the given token address is in the allowed list.
+    fn is_token_allowed(env: &Env, token: &Address) -> bool {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        tokens.iter().any(|t| &t == token)
+    }
+
     pub fn get_nonce(env: Env, address: Address) -> u64 {
         get_nonce(&env, &address)
     }
@@ -1336,6 +1532,13 @@ impl Marketplace {
     // ── Contract Upgrade ─────────────────────────────────────────────────────
 
     /// Upgrade the contract WASM to a new hash. Only the admin may call this.
+    ///
+    /// Execution order:
+    /// 1. Validate admin identity and nonce.
+    /// 2. Run `run_migrations` (any schema changes for the new version).
+    /// 3. Increment `DataKey::Version`.
+    /// 4. Swap the WASM.
+    /// 5. Emit `ContractUpgraded` event.
     ///
     /// # Errors
     /// - [`MarketplaceError::NotInitialized`] — contract has not been initialised.
@@ -1351,7 +1554,21 @@ impl Marketplace {
         if !Self::consume_nonce(&env, &admin, nonce) {
             return Err(MarketplaceError::InvalidNonce);
         }
+        // Run migrations BEFORE swapping WASM so the new code sees migrated state.
+        run_migrations(&env);
+        // Increment version
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1u32);
+        let new_version = current_version + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &new_version);
+        // Swap WASM
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        ContractUpgraded { admin, new_version }.publish(&env);
         Ok(())
     }
 }

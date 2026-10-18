@@ -30,19 +30,21 @@ All CarbonChain smart contracts use stable numeric error codes. These codes are 
 | 124 | `InvalidApprovalThreshold` | `required_approvals` is 0 or exceeds verifier count |
 | 125 | `AlreadyApproved` | Verifier has already approved this credit |
 
-## Retirement (110–118)
+## Retirement (200–210)
 
-| Code | Name | Description |
-|------|------|-------------|
-| 110 | `CreditNotActive` | Credit is not in `Active` status |
-| 111 | `AlreadyInitialized` | Contract has already been initialized |
-| 112 | `NotInitialized` | Contract has not been initialized |
-| 113 | `Unauthorized` | Caller is not the credit owner or admin |
-| 114 | `ContractPaused` | Contract is paused |
-| 115 | `InvalidNonce` | Replay-protection nonce mismatch |
-| 116 | `NoPendingAdmin` | No pending admin transfer |
-| 117 | `InvalidTonnes` | `tonnes` is zero or negative |
-| 118 | `InvalidInput` | Input vectors have mismatched lengths or batch exceeds `MAX_BATCH_SIZE` (20) |
+| Code | Name | Description | Triggering Functions |
+|------|------|-------------|----------------------|
+| 200 | `CreditNotActive` | Credit is not in `Active` status when retirement is attempted | `retire`, `batch_retire` |
+| 201 | `AlreadyInitialized` | Contract has already been initialized | `initialize` |
+| 202 | `NotInitialized` | Contract has not been initialized | `pause`, `unpause`, `upgrade`, `propose_admin`, `set_certificate_hash` |
+| 203 | `Unauthorized` | Caller is not the credit owner or admin | `retire`, `batch_retire`, `pause`, `unpause`, `upgrade`, `propose_admin`, `set_certificate_hash` |
+| 204 | `ContractPaused` | Contract is paused; state-mutating operations are blocked | `retire`, `batch_retire` |
+| 205 | `InvalidNonce` | Replay-protection nonce does not match expected value | `retire`, `batch_retire`, `upgrade`, `set_certificate_hash` |
+| 206 | `NoPendingAdmin` | No admin transfer is currently pending | `accept_admin` |
+| 207 | `InvalidTonnes` | `tonnes` is zero, negative, or not a multiple of 100,000 | `retire`, `batch_retire` |
+| 208 | `InvalidInput` | Input vectors have mismatched lengths, or batch exceeds `MAX_BATCH_SIZE` (20) | `batch_retire` |
+| 209 | `DowngradeNotAllowed` | Installing an older WASM version is not allowed | `upgrade` |
+| 210 | `RecordNotFound` | A retirement record with the given ID does not exist in storage | `set_certificate_hash` |
 
 ## Marketplace (300–313)
 

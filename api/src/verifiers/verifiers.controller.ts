@@ -1,20 +1,33 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
+  ForbiddenException,
   Get,
   Header,
   HttpCode,
   Param,
   Post,
+  Query,
   Request,
   UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { StrKey } from '@stellar/stellar-sdk';
 import { VerifiersService, VerifierInfo } from './verifiers.service';
+import {
+  VerifierApplicationEntity,
+  VerifierApplicationStatus,
+} from './verifier-application.entity';
 import { CreditMetadata, VerifierReputation } from '../../../shared';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AdminGuard } from '../admin/admin.guard';
 
 @ApiTags('verifiers')
 @Controller('verifiers')
@@ -54,19 +67,45 @@ export class VerifiersController {
   @ApiOperation({ summary: 'Get pending credits for a verifier' })
   @ApiResponse({ status: 200, description: 'Pending credits' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - can only view own pending credits',
+  })
   @UseGuards(JwtAuthGuard)
-  @Get(':id/pending')
-  async getPendingCredits(@Request() req: any): Promise<CreditMetadata[]> {
-    return this.verifiersService.getPendingCredits(req.user.account);
+  @Get(':address/pending')
+  async getPendingCredits(
+    @Param('address') address: string,
+    @Request() req: any,
+  ): Promise<CreditMetadata[]> {
+    const caller = req.user?.account;
+    if (caller !== address && req.user?.role !== 'admin') {
+      throw new ForbiddenException(
+        'You can only view your own pending credits',
+      );
+    }
+    return this.verifiersService.getPendingCredits(address);
   }
 
   @ApiOperation({ summary: 'Get approval history for a verifier' })
   @ApiResponse({ status: 200, description: 'Approval history' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - can only view own approval history',
+  })
   @UseGuards(JwtAuthGuard)
-  @Get(':id/history')
-  async getApprovalHistory(@Request() req: any): Promise<CreditMetadata[]> {
-    return this.verifiersService.getApprovalHistory(req.user.account);
+  @Get(':address/history')
+  async getApprovalHistory(
+    @Param('address') address: string,
+    @Request() req: any,
+  ): Promise<CreditMetadata[]> {
+    const caller = req.user?.account;
+    if (caller !== address && req.user?.role !== 'admin') {
+      throw new ForbiddenException(
+        'You can only view your own approval history',
+      );
+    }
+    return this.verifiersService.getApprovalHistory(address);
   }
 
   @ApiOperation({ summary: 'Approve a pending credit as a verifier' })
@@ -227,6 +266,71 @@ export class VerifiersController {
       account,
       body.tokenId,
       body.nonce,
+    );
+  }
+
+  // ── Applications (Issue #967) ───────────────────────────────────────────────
+
+  @ApiOperation({ summary: 'Submit a verifier application' })
+  @ApiResponse({ status: 201, description: 'Application submitted' })
+  @ApiResponse({ status: 409, description: 'Application already pending' })
+  @Post('applications')
+  async submitApplication(
+    @Body()
+    body: {
+      address: string;
+      name: string;
+      capabilities: string[];
+      documentsCid: string;
+      stakeToken: string;
+      stakeAmount: string;
+    },
+  ): Promise<VerifierApplicationEntity> {
+    return this.verifiersService.submitApplication(body);
+  }
+
+  @ApiOperation({ summary: 'Get verifier application status' })
+  @ApiResponse({ status: 200, description: 'Application details' })
+  @ApiResponse({ status: 404, description: 'No application found' })
+  @Get('applications/:address')
+  async getApplication(
+    @Param('address') address: string,
+  ): Promise<VerifierApplicationEntity | null> {
+    return this.verifiersService.getApplication(address);
+  }
+
+  @ApiOperation({ summary: 'List pending verifier applications (admin)' })
+  @ApiResponse({ status: 200, description: 'List of applications' })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, AdminGuard)
+  @Get('admin/applications')
+  async listApplications(
+    @Query('status') status?: string,
+  ): Promise<VerifierApplicationEntity[]> {
+    const filter =
+      status === VerifierApplicationStatus.Approved
+        ? VerifierApplicationStatus.Approved
+        : status === VerifierApplicationStatus.Rejected
+          ? VerifierApplicationStatus.Rejected
+          : undefined;
+    return this.verifiersService.listApplications(filter);
+  }
+
+  @ApiOperation({ summary: 'Approve or reject a verifier application (admin)' })
+  @ApiResponse({ status: 200, description: 'Application updated' })
+  @ApiResponse({ status: 404, description: 'Application not found' })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, AdminGuard)
+  @Post('admin/applications/:address/review')
+  async reviewApplication(
+    @Param('address') address: string,
+    @Body() body: { status: VerifierApplicationStatus },
+    @Request() req: any,
+  ): Promise<VerifierApplicationEntity | null> {
+    return this.verifiersService.reviewApplication(
+      address,
+      body.status,
+      req.user.account,
     );
   }
 }

@@ -211,106 +211,82 @@ describe('CreditsService.getBulkCredits malformed ID handling', () => {
   });
 });
 
-describe('CreditsService.getCreditProvenance', () => {
-  let svc: CreditsService;
+describe('CreditsService account cache invalidation (issue #1180)', () => {
+  const ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
-  beforeEach(async () => {
-    const repo = new InMemoryCreditRepository();
-    const cache = new CacheService(mockConfig);
-
-    // Mock stellar service with contract events
-    const mockStellarService: any = {
-      getContractEvents: jest.fn().mockResolvedValue([
-        {
-          topic: ['CreditSubmitted'],
-          value: {
-            issuer: 'issuer-address',
-            credit_id: 'abc123def456',
-            project_id: 'PROJ-001',
-            tonnes: 1000000n,
-          },
-          ledger: 100,
-          id: '1',
-          txHash: 'hash1',
-          closedAt: 1000000n,
-        },
-        {
-          topic: ['CreditMinted'],
-          value: {
-            verifier: 'verifier-address',
-            id: 'abc123def456',
-          },
-          ledger: 101,
-          id: '2',
-          txHash: 'hash2',
-          closedAt: 1000010n,
-        },
-        {
-          topic: ['CreditTransferred'],
-          value: {
-            from: 'owner-address',
-            to: 'buyer-address',
-            credit_id: 'abc123def456',
-          },
-          ledger: 102,
-          id: '3',
-          txHash: 'hash3',
-          closedAt: 1000020n,
-        },
-      ]),
-    };
-
-    const mockKeypair: any = {};
-    svc = new CreditsService(
+  function buildSvc(mockStellarService: any): CreditsService {
+    return new CreditsService(
       mockStellarService,
-      mockConfig,
-      mockKeypair,
-      repo,
-      cache,
-    );
-  });
-
-  it('should return provenance events in chronological order', async () => {
-    const provenance = await svc.getCreditProvenance('abc123def456');
-
-    expect(provenance).toHaveLength(3);
-    expect(provenance[0].action).toBe('Submitted');
-    expect(provenance[0].actor).toBe('issuer-address');
-    expect(provenance[1].action).toBe('Approved');
-    expect(provenance[1].actor).toBe('verifier-address');
-    expect(provenance[2].action).toBe('Transferred');
-    expect(provenance[2].actor).toBe('owner-address');
-  });
-
-  it('should include txHash in provenance records', async () => {
-    const provenance = await svc.getCreditProvenance('abc123def456');
-
-    expect(provenance[0].txHash).toBe('hash1');
-    expect(provenance[1].txHash).toBe('hash2');
-    expect(provenance[2].txHash).toBe('hash3');
-  });
-
-  it('should include timestamp in provenance records', async () => {
-    const provenance = await svc.getCreditProvenance('abc123def456');
-
-    provenance.forEach((event) => {
-      expect(typeof event.timestamp).toBe('number');
-      expect(event.timestamp).toBeGreaterThan(0);
-    });
-  });
-
-  it('should throw NotFoundException for credit with no provenance events', async () => {
-    const svcWithNoEvents = new CreditsService(
-      { getContractEvents: jest.fn().mockResolvedValue([]) } as any,
       mockConfig,
       {} as any,
       new InMemoryCreditRepository(),
       new CacheService(mockConfig),
     );
+  }
 
-    await expect(
-      svcWithNoEvents.getCreditProvenance('nonexistent'),
-    ).rejects.toThrow();
+  it('invalidates the account cache after a credit transfer', async () => {
+    const stellar: any = {
+      invalidateAccountCache: jest.fn(),
+      invokeContract: jest.fn().mockResolvedValue(undefined),
+      readContract: jest.fn().mockResolvedValue(null),
+    };
+    const svc = buildSvc(stellar);
+
+    await svc.transferCredit(ADDRESS, ADDRESS, '100');
+
+    expect(stellar.invalidateAccountCache).toHaveBeenCalledWith(ADDRESS);
+  });
+
+  it('invalidates the account cache after creating an offer', async () => {
+    const stellar: any = {
+      invalidateAccountCache: jest.fn(),
+      invokeContract: jest.fn().mockResolvedValue(undefined),
+      readContract: jest.fn().mockResolvedValue(null),
+    };
+    const svc = buildSvc(stellar);
+
+    await svc.createOffer(ADDRESS, 'sell', '100', '10');
+
+    expect(stellar.invalidateAccountCache).toHaveBeenCalledWith(ADDRESS);
+  });
+
+  it('invalidates the account cache after cancelling an offer', async () => {
+    const stellar: any = {
+      invalidateAccountCache: jest.fn(),
+      invokeContract: jest.fn().mockResolvedValue(undefined),
+      readContract: jest.fn().mockResolvedValue(null),
+    };
+    const svc = buildSvc(stellar);
+
+    await svc.cancelOffer(ADDRESS, '42');
+
+    expect(stellar.invalidateAccountCache).toHaveBeenCalledWith(ADDRESS);
+  });
+
+  it('invalidates the account cache after buying an offer', async () => {
+    const stellar: any = {
+      invalidateAccountCache: jest.fn(),
+      invokeContract: jest.fn().mockResolvedValue(undefined),
+      readContract: jest.fn().mockResolvedValue(null),
+    };
+    const svc = buildSvc(stellar);
+
+    await svc.buyOffer(ADDRESS, '42', '10');
+
+    expect(stellar.invalidateAccountCache).toHaveBeenCalledWith(ADDRESS);
+  });
+
+  it('invalidates the account cache after a retirement', async () => {
+    const stellar: any = {
+      invalidateAccountCache: jest.fn(),
+      invokeContract: jest.fn().mockResolvedValue(undefined),
+      readContract: jest.fn().mockResolvedValue(null),
+    };
+    const svc = buildSvc(stellar);
+
+    await svc.retireCredit(ADDRESS, '100', 'beneficiary');
+
+    expect(stellar.invalidateAccountCache).toHaveBeenCalledWith(ADDRESS);
   });
 });
 

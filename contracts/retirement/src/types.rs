@@ -69,6 +69,9 @@ pub enum DataKey {
     /// IPFS hash of the off-chain retirement certificate PDF.
     /// Set after retirement via `set_certificate_hash`.
     CertificateHash(BytesN<32>),
+    /// Global index of all retirement IDs across all accounts (issue #1079).
+    /// Stored in instance storage. Used by `list_all_retirements` for admin auditing.
+    AllRetirements,
 }
 
 /// A single failed retirement entry within a partial-success batch.

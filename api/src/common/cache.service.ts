@@ -199,6 +199,63 @@ export class CacheService implements OnModuleDestroy {
   }
 
   /**
+   * Retrieve multiple cached values in a single Redis MGET round-trip.
+   * Returns an array aligned with `keys`; missing keys and unparseable values
+   * map to `null`. Returns an all-`null` array when the cache is unavailable.
+   */
+  async mget<T>(keys: string[]): Promise<(T | null)[]> {
+    if (keys.length === 0) return [];
+    if (!this.isCacheAvailable()) return keys.map(() => null);
+    try {
+      const raws = await this.client!.mget(keys);
+      return raws.map((raw) => {
+        if (!raw) return null;
+        try {
+          return JSON.parse(raw) as T;
+        } catch {
+          return null;
+        }
+      });
+    } catch (err) {
+      this.logger.warn(
+        `Cache MGET failed for ${keys.length} keys: ${(err as Error).message}`,
+      );
+      this.recordFailure();
+      return keys.map(() => null);
+    }
+  }
+
+  /**
+   * Enumerate all keys matching a glob pattern using SCAN (non-blocking).
+   * Returns an empty array when the cache is unavailable.
+   */
+  async scanKeys(pattern: string): Promise<string[]> {
+    if (!this.isCacheAvailable()) return [];
+    try {
+      const keys: string[] = [];
+      let cursor: string = '0';
+      do {
+        const [nextCursor, matchedKeys] = await this.client!.scan(
+          cursor,
+          'MATCH',
+          pattern,
+          'COUNT',
+          100,
+        );
+        cursor = nextCursor;
+        keys.push(...matchedKeys);
+      } while (cursor !== '0');
+      return keys;
+    } catch (err) {
+      this.logger.warn(
+        `Cache SCAN "${pattern}" failed: ${(err as Error).message}`,
+      );
+      this.recordFailure();
+      return [];
+    }
+  }
+
+  /**
    * Store a value with an optional TTL (seconds). Defaults to CACHE_TTL_SECONDS env var.
    *
    * Returns `false` when the value could not be persisted (cache unavailable or
@@ -368,6 +425,46 @@ export class CacheService implements OnModuleDestroy {
         `Cache tag invalidation failed for tag "${tag}": ${(err as Error).message}`,
       );
     }
+  }
+
+  /**
+   * Probe Redis connectivity and measure ping latency.
+   *
+   * Returns `down` when there is no client, the connection is not established,
+   * or the ping fails; `degraded` when the round-trip exceeds
+   * `REDIS_HEALTH_DEGRADED_MS` (default 100ms); otherwise `ok`.
+   *
+   * Intentionally does not touch the circuit breaker — health probes must not
+   * affect request-path degradation behaviour.
+   */
+  async healthCheck(): Promise<{
+    status: 'ok' | 'degraded' | 'down';
+    latencyMs: number;
+  }> {
+    if (!this.client || !this.connected) {
+      return { status: 'down', latencyMs: 0 };
+    }
+
+    const start = process.hrtime.bigint();
+    try {
+      await this.client.ping();
+    } catch (err) {
+      this.logger.warn(
+        `Redis health check ping failed: ${(err as Error).message}`,
+      );
+      return { status: 'down', latencyMs: 0 };
+    }
+    const latencyMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+    const degradedThresholdMs = this.config.get<number>(
+      'REDIS_HEALTH_DEGRADED_MS',
+      100,
+    );
+
+    return {
+      status: latencyMs > degradedThresholdMs ? 'degraded' : 'ok',
+      latencyMs: Math.round(latencyMs * 100) / 100,
+    };
   }
 
   /** Returns true when a live Redis connection is available and circuit breaker is closed. */
